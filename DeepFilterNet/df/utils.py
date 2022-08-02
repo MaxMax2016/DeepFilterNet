@@ -8,7 +8,6 @@ from typing import Any, Dict, Set, Tuple, Union
 
 import numpy as np
 import torch
-from appdirs import user_cache_dir
 from loguru import logger
 from torch import Tensor
 from torch._six import string_classes
@@ -258,4 +257,6 @@ def download_file(url: str, download_dir: str, extract: bool = False):
 
 
 def get_cache_dir():
+    from appdirs import user_cache_dir
+
     return user_cache_dir("DeepFilterNet")
