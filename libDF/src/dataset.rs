@@ -1,4 +1,5 @@
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -552,11 +553,10 @@ impl DatasetBuilder {
             Ok(())
         })?;
         sender.send(None).unwrap();
-        let mut config = Vec::new();
-        let mut hdf5_handles = Vec::new();
+        let mut config = HashMap::new();
+        let mut hdf5_handles = HashMap::new();
         let mut ds_keys = Vec::new();
         let mut has_rirs = false;
-        let mut i = 0;
         let mut ds_len: usize = 0;
         while let Some((cfg, ds)) = receiver.try_recv().unwrap() {
             has_rirs = has_rirs || ds.dstype == DsType::RIR;
@@ -564,8 +564,9 @@ impl DatasetBuilder {
             if ds.dstype == DsType::Speech {
                 ds_len += (keys.len() as f32 * cfg.sampling_factor()).round() as usize;
             }
-            ds_keys.push((ds.dstype, i, keys));
-            config.push(cfg);
+            ds_keys.push((ds.dstype, ds.name(), keys));
+            assert!(!config.contains_key(&ds.name()));
+            config.insert(ds.name(), cfg);
             log::debug!(
                 "Found {} {} dataset {} with {} samples",
                 &ds.dstype,
@@ -573,8 +574,7 @@ impl DatasetBuilder {
                 ds.name(),
                 ds.len()
             );
-            hdf5_handles.push(ds);
-            i += 1;
+            hdf5_handles.insert(ds.name(), ds);
         }
         if hdf5_handles.is_empty() {
             return Err(DfDatasetError::NoDatasetFoundError);
@@ -749,7 +749,7 @@ pub struct FftDataset {
 }
 impl FftDataset {
     pub fn get_hdf5cfg(&self, filename: &str) -> Option<&Hdf5Cfg> {
-        for cfg in &self.ds.config {
+        for cfg in self.ds.config.values() {
             if cfg.filename() == filename {
                 return Some(cfg);
             }
@@ -862,15 +862,15 @@ impl Dataset<Complex32> for FftDataset {
 }
 
 pub struct TdDataset {
-    config: Vec<Hdf5Cfg>,                       // config
-    hdf5_handles: Vec<Hdf5Dataset>,             // Handles to access opened Hdf5 datasets
-    max_samples: usize,                         // Number of samples in time domain
-    sr: usize,                                  // Sampling rate
-    ds_keys: Vec<(DsType, usize, Vec<String>)>, // Dataset keys as a vector of [DS Type, hdf5 index, Vec<str keys>].
-    ds_split: Split,                            // Train/Valid/Test
-    sp_keys: Vec<(usize, String)>, // Pair of hdf5 index and dataset keys. Will be generated at each epoch start
-    ns_keys: Vec<(usize, String)>,
-    rir_keys: Vec<(usize, String)>,
+    config: HashMap<String, Hdf5Cfg>,            // config
+    hdf5_handles: HashMap<String, Hdf5Dataset>,  // Handles to access opened Hdf5 datasets
+    max_samples: usize,                          // Number of samples in time domain
+    sr: usize,                                   // Sampling rate
+    ds_keys: Vec<(DsType, String, Vec<String>)>, // Dataset keys as a vector of [DS Type, hdf5 index, Vec<str keys>].
+    ds_split: Split,                             // Train/Valid/Test
+    sp_keys: Vec<(String, String)>, // Pair of hdf5 name and dataset keys. Will be generated at each epoch start
+    ns_keys: Vec<(String, String)>,
+    rir_keys: Vec<(String, String)>,
     snrs: Vec<i8>,                   // in dB; SNR to sample from
     gains: Vec<i8>,                  // in dB; Speech (loudness) to sample from
     p_fill_speech: f32, // Probability to completely fill the speech signal to `max_samples` with a different speech sample
@@ -889,11 +889,12 @@ impl TdDataset {
     fn _read_from_hdf5(
         &self,
         key: &str,
-        idx: usize,
+        name: &str,
         max_len: Option<usize>,
     ) -> Result<Array2<f32>> {
-        let h = &self.hdf5_handles[idx];
-        let sr = h.sr.unwrap_or_else(|| self.config[idx].fallback_sr().unwrap_or(self.sr));
+        let h = &self.hdf5_handles.get(name).unwrap();
+        let sr =
+            h.sr.unwrap_or_else(|| self.config.get(name).unwrap().fallback_sr().unwrap_or(self.sr));
         let slc = if let Some(l) = max_len {
             let l_sr = l * sr / self.sr;
             let sample_len = h.sample_len(key)?;
@@ -916,11 +917,7 @@ impl TdDataset {
         .map_err(move |e: DfDatasetError| -> DfDatasetError {
             DfDatasetError::ErrorDetail {
                 source: Box::new(e),
-                msg: format!(
-                    "Error reading sample '{}' from dataset {}",
-                    key,
-                    self.ds_name(idx)
-                ),
+                msg: format!("Error reading sample '{}' from dataset {}", key, name,),
             }
         })?;
         if sr != self.sr {
@@ -935,32 +932,32 @@ impl TdDataset {
         Ok(x)
     }
 
-    fn read(&self, idx: usize, key: &str) -> Result<Array2<f32>> {
-        let x = self._read_from_hdf5(key, idx, None)?;
+    fn read(&self, name: &str, key: &str) -> Result<Array2<f32>> {
+        let x = self._read_from_hdf5(key, name, None)?;
         Ok(x)
     }
 
-    fn read_all_channels(&self, idx: usize, key: &str) -> Result<Array2<f32>> {
-        let x = self._read_from_hdf5(key, idx, None)?;
+    fn read_all_channels(&self, name: &str, key: &str) -> Result<Array2<f32>> {
+        let x = self._read_from_hdf5(key, name, None)?;
         Ok(x)
     }
 
     fn read_max_len(
         &self,
-        idx: usize,
+        ds_name: &str,
         key: &str,
         max_samples: Option<usize>,
     ) -> Result<Array2<f32>> {
         #[cfg(feature = "dataset_timings")]
         let t0 = Instant::now();
         let max_samples = max_samples.unwrap_or(self.max_samples);
-        let x = match self._read_from_hdf5(key, idx, Some(max_samples)) {
+        let x = match self._read_from_hdf5(key, ds_name, Some(max_samples)) {
             Err(e) => {
                 log::warn!(
                     "Error during {} read_max_len() for key '{}' from dataset {}: {:?}",
-                    self.ds_type(idx),
+                    self.ds_type(ds_name),
                     key,
-                    self.ds_name(idx),
+                    ds_name,
                     e
                 );
                 let e_str = e.to_string();
@@ -970,54 +967,55 @@ impl TdDataset {
                     let (sp_idx, sp_key) = &self.sp_keys[idx];
                     log::warn!(
                         "Returning a different speech sample from {} due to {}",
-                        self.ds_name(*sp_idx),
+                        ds_name,
                         e_str
                     );
-                    self.read_max_len(*sp_idx, sp_key, Some(max_samples))?
+                    self.read_max_len(sp_idx, sp_key, Some(max_samples))?
                 } else {
                     return Err(e);
                 }
             }
             Ok(s) => s,
         };
-        #[cfg(feature = "dataset_timings")]
-        {
-            log::trace!(
-                "Loaded sample {} with codec {:?} in {} ms",
+        if log::log_enabled!(log::Level::Trace) {
+            #[allow(unused_mut)]
+            let mut msg = format!(
+                "Loaded sample {} with codec {:?}",
                 key,
-                self.ds_codec(idx),
-                (Instant::now() - t0).as_millis()
+                self.ds_codec(ds_name)
             );
+            #[cfg(feature = "dataset_timings")]
+            msg.push_str(format!(" in {} ms", (Instant::now() - t0).as_millis()));
+            log::trace!("{}", msg);
         }
         debug_assert!(x.len_of(Axis(1)) <= max_samples);
         Ok(x)
     }
 
-    fn max_freq(&self, idx: usize) -> Result<usize> {
-        let ds = &self.hdf5_handles[idx];
+    fn max_freq(&self, name: &str) -> Result<usize> {
+        let ds = &self.hdf5_handles.get(name).unwrap();
         let max_freq = match ds.max_freq {
             Some(x) if x > 0 => x,
-            _ => self.config[idx].fallback_max_freq().unwrap_or_else(|| {
-                ds.sr.unwrap_or_else(|| self.config[idx].fallback_sr().unwrap_or(self.sr)) / 2
-            }),
+            _ => {
+                let cfg = self.config.get(name).unwrap();
+                cfg.fallback_max_freq().unwrap_or_else(|| {
+                    ds.sr.unwrap_or_else(|| cfg.fallback_sr().unwrap_or(self.sr)) / 2
+                })
+            }
         };
         Ok(max_freq)
     }
 
-    fn ds_name(&self, idx: usize) -> String {
-        self.hdf5_handles[idx].name()
+    fn ds_type(&self, name: &str) -> String {
+        self.hdf5_handles.get(name).unwrap().ds_type()
     }
 
-    fn ds_type(&self, idx: usize) -> String {
-        self.hdf5_handles[idx].ds_type()
-    }
-
-    fn ds_codec(&self, idx: usize) -> Codec {
-        self.hdf5_handles[idx].codec.clone().unwrap_or_default()
+    fn ds_codec(&self, name: &str) -> Codec {
+        self.hdf5_handles.get(name).unwrap().codec.clone().unwrap_or_default()
     }
 
     fn load_aug_speech(&self, idx: usize, rng: &mut SeededRng) -> Result<(Array2<f32>, usize)> {
-        let (mut sp_idx, mut sp_key) = self.sp_keys[idx].clone();
+        let (mut sp_name, mut sp_key) = self.sp_keys[idx].clone();
         let mut max_freq = self.sr / 2;
         let mut cur_len = 0;
         let mut speech_samples = Vec::new();
@@ -1031,11 +1029,11 @@ impl TdDataset {
         while cur_len < self.max_sample_len() {
             // Read 10% more samples since augmentation might shorten the signal
             let n_read = (self.max_samples as f32 * 1.1) as usize - cur_len;
-            let mut sample = self.read_max_len(sp_idx, &sp_key, Some(n_read))?;
+            let mut sample = self.read_max_len(&sp_name, &sp_key, Some(n_read))?;
             if sample.len_of(Axis(0)) > 1 {
                 sample.slice_axis_inplace(Axis(0), Slice::from(0usize..1));
             }
-            max_freq = max_freq.min(self.max_freq(sp_idx)?);
+            max_freq = max_freq.min(self.max_freq(&sp_name)?);
             if self.bw_limiter.is_some() {
                 // Extend clean speech to make sure it covers the full spectrum
                 let mut spec = stft(sample.view(), state.as_mut().unwrap(), false);
@@ -1051,7 +1049,7 @@ impl TdDataset {
             self.sp_augmentations.transform(&mut (&mut sample).into())?;
             cur_len += sample.len_of(Axis(1));
             speech_samples.push(sample);
-            (sp_idx, sp_key) = self.sp_keys.choose(rng).unwrap().clone();
+            (sp_name, sp_key) = self.sp_keys.choose(rng).unwrap().clone();
         }
         let speech_views: Vec<ArrayView2<f32>> = speech_samples.iter().map(|s| s.view()).collect();
         let mut speech = concatenate(Axis(1), speech_views.as_slice())?;
@@ -1071,8 +1069,8 @@ impl TdDataset {
             return Ok((ns, *[-24., -12., -6., 0.].choose(rng).unwrap()));
         }
         loop {
-            let (ns_idx, ns_key) = self.ns_keys.iter().choose(rng).unwrap();
-            let mut ns = match self.read_max_len(*ns_idx, ns_key, None) {
+            let (ns_name, ns_key) = self.ns_keys.iter().choose(rng).unwrap();
+            let mut ns = match self.read_max_len(ns_name, ns_key, None) {
                 Err(e) => {
                     log::warn!("Error during noise reading get_sample(): {}", e);
                     continue;
@@ -1120,13 +1118,13 @@ impl Dataset<f32> for TdDataset {
             noises.push(ns);
             noise_gains.push(gain);
         }
-        #[cfg(feature = "dataset_timings")]
-        let t_ns = Instant::now();
         // Sample SNR and gain
         let &snr = self.snrs.choose(&mut rng).unwrap();
         let &gain = self.gains.choose(&mut rng).unwrap();
         // Truncate to speech len, combine noises and mix to noisy
         let mut noise = combine_noises(ch, len, &mut noises, Some(noise_gains.as_slice()))?;
+        #[cfg(feature = "dataset_timings")]
+        let t_ns = Instant::now();
         // Optionally we may also introduce some distortions to the speech signal.
         // These distortions will be only present in the noisy mixture, with the aim to reconstruce
         // the original undistorted signal. Example distortions are reverberation, or clipping.
@@ -1135,8 +1133,8 @@ impl Dataset<f32> for TdDataset {
         let mut speech_distorted = {
             if !self.rir_keys.is_empty() {
                 self.reverb.transform(&mut speech, &mut noise, || {
-                    let (rir_idx, rir_key) = self.rir_keys.iter().choose(&mut rng).unwrap();
-                    let rir = self.read(*rir_idx, rir_key)?;
+                    let (rir_name, rir_key) = self.rir_keys.iter().choose(&mut rng).unwrap();
+                    let rir = self.read(rir_name, rir_key)?;
                     Ok(rir)
                 })?
             } else {
@@ -1173,6 +1171,8 @@ impl Dataset<f32> for TdDataset {
             speech_distorted = istft(x.view_mut(), &mut state, false);
             speech_distorted.slice_axis_inplace(Axis(1), Slice::from(0..speech.len_of(Axis(1))));
         }
+        #[cfg(feature = "dataset_timings")]
+        let t_d = Instant::now(); // distortions
         let (speech, _, noisy) = mix_audio_signal(
             speech,
             Some(speech_distorted),
@@ -1184,11 +1184,12 @@ impl Dataset<f32> for TdDataset {
         if log::log_enabled!(log::Level::Trace) {
             let te = std::time::Instant::now();
             log::trace!(
-                "TD sample: {:?} ms (speech: {:?} ms, noise: {:?} ms, mix: {:?} ms)",
+                "TD sample: {:?} ms (speech: {:?} ms, noise: {:?} ms, distortions: {:?}, mix: {:?} ms)",
                 (te - t0).as_millis(),
                 (t_sp - t0).as_millis(),
                 (t_ns - t_sp).as_millis(),
-                (te - t_ns).as_millis(),
+                (t_d - t_ns).as_millis(),
+                (te - t_d).as_millis(),
             );
         }
         Ok(Sample {
@@ -1225,8 +1226,8 @@ impl Dataset<f32> for TdDataset {
             return true;
         }
         if self.ds_split == Split::Train {
-            for (_, hdf5_idx, _) in self.ds_keys.iter() {
-                let f = self.config[*hdf5_idx].sampling_factor();
+            for (_, name, _) in self.ds_keys.iter() {
+                let f = self.config.get(name).unwrap().sampling_factor();
                 // if not a natural number, then we need to regenerate.
                 if f != f.round() {
                     return true;
@@ -1241,17 +1242,17 @@ impl Dataset<f32> for TdDataset {
         self.ns_keys.clear();
         self.rir_keys.clear();
 
-        for (dstype, hdf5_idx, keys) in self.ds_keys.iter() {
-            debug_assert_eq!(&self.hdf5_handles[*hdf5_idx].keys().unwrap(), keys);
+        for (dstype, name, keys) in self.ds_keys.iter() {
+            debug_assert_eq!(&self.hdf5_handles.get(name).unwrap().keys().unwrap(), keys);
             let len = keys.len();
             let n_samples =
-                (self.config[*hdf5_idx].sampling_factor() * len as f32).round() as usize;
+                (self.config.get(name).unwrap().sampling_factor() * len as f32).round() as usize;
             let mut keys = keys.clone();
             if self.ds_split == Split::Train {
                 keys.shuffle(&mut thread_rng()?);
             }
-            let keys: Vec<(usize, String)> =
-                keys.iter().cycle().take(n_samples).map(|k| (*hdf5_idx, k.clone())).collect();
+            let keys: Vec<(String, String)> =
+                keys.iter().cycle().take(n_samples).map(|k| (name.clone(), k.clone())).collect();
             match dstype {
                 DsType::Speech => self.sp_keys.extend(keys),
                 DsType::Noise => self.ns_keys.extend(keys),
@@ -1957,6 +1958,7 @@ mod tests {
 
     #[test]
     pub fn test_hdf5_read_pcm() -> Result<()> {
+        setup();
         seed_from_u64(0);
         let hdf5 = Hdf5Dataset::new("../assets/noise.hdf5")?;
         for key in hdf5.keys()?.iter() {
@@ -1977,6 +1979,7 @@ mod tests {
     }
     #[test]
     pub fn test_hdf5_read_vorbis() -> Result<()> {
+        setup();
         seed_from_u64(0);
         let hdf5 = Hdf5Dataset::new("../assets/noise_vorbis.hdf5")?;
         for key in hdf5.keys()?.iter() {
@@ -1998,6 +2001,7 @@ mod tests {
     }
     #[test]
     pub fn test_hdf5_read_flac() -> Result<()> {
+        setup();
         seed_from_u64(0);
         let hdf5 = Hdf5Dataset::new("../assets/noise_flac.hdf5")?;
         for key in hdf5.keys()?.iter() {
@@ -2040,6 +2044,7 @@ mod tests {
         #[case] r: Range<usize>,
         #[case] snr: f32,
     ) {
+        setup();
         seed_from_u64(0);
         let hdf5 = Hdf5Dataset::new(ds).unwrap();
         // "assets_noise_freesound_573577.wav" has a length of approx 4.8s
@@ -2076,6 +2081,7 @@ mod tests {
     }
     #[test]
     pub fn test_mix_audio_signal() -> Result<()> {
+        setup();
         seed_from_u64(0);
         let sr = 48_000;
         let n = sr;
@@ -2121,6 +2127,7 @@ mod tests {
     }
     #[test]
     pub fn test_td_dataset() -> Result<()> {
+        setup();
         seed_from_u64(0);
         let sr = 48_000;
         let dir = "../assets/";
@@ -2149,6 +2156,7 @@ mod tests {
     }
     #[test]
     pub fn test_fft_dataset() -> Result<()> {
+        setup();
         seed_from_u64(0);
         let sr = 48_000;
         let n_fft = 1024;
@@ -2183,8 +2191,6 @@ mod tests {
     pub fn test_cached_valid_dataset() -> Result<()> {
         use std::collections::BTreeMap;
 
-        use log::info;
-
         setup();
         seed_from_u64(42);
         let fft_size = 960;
@@ -2199,7 +2205,7 @@ mod tests {
             if item.is_dir()
                 && item.file_name().unwrap().to_str().unwrap().starts_with("valid_cache_")
             {
-                info!("Removing existing cache '{:?}'", item);
+                log::info!("Removing existing cache '{:?}'", item);
                 fs::remove_dir_all(item)?;
             }
         }
@@ -2216,7 +2222,7 @@ mod tests {
             .build_fft_dataset()?;
         let ds_len = val_ds.len();
         let mut mixture_cache = BTreeMap::new();
-        info!("Dataset length: {}", ds_len);
+        log::info!("Dataset length: {}", ds_len);
         for seed in [42, 43] {
             for _epoch in 0..2 {
                 val_ds.set_seed(seed);
@@ -2227,7 +2233,7 @@ mod tests {
                     let sample = val_ds.get_sample(idx, Some(seed + idx as u64))?;
                     let key = (seed, idx);
                     if let Some(cached_noisy) = mixture_cache.get(&key) {
-                        info!("Found sample {:?} in cache", key);
+                        log::info!("Found sample {:?} in cache", key);
                         assert_eq!(sample.noisy, cached_noisy);
                     } else {
                         mixture_cache.insert(key, sample.noisy.clone());
